@@ -264,7 +264,7 @@ def main():
         k=7,
         context_proportion=0.5
     )
-    model = Avey()
+    model = Avey(config)
     if ddp_rank == 0:
         print("PARAMERETS:", sum(p.numel() for p in model.parameters()))
     model.to(device)
