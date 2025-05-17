@@ -1,12 +1,48 @@
+# based on https://github.com/karpathy/build-nanogpt/blob/master/train_gpt2.py
+
+# -----------------------------------------------------------------------------
+# CONFIGURATION
+# -----------------------------------------------------------------------------
+MODEL_TOKENIZER = "p50k_base"
+
+TRAIN_CONFIG = {
+    "total_batch_size": 2 ** 19,  # ~0.5M tokens
+    "seq_length": 512,
+    "max_steps": 2000,
+    "inference_interval": 500,
+    "checkpoint_interval": 500,
+    "rng_seed": 11,
+    "use_torch_compile": True,
+
+    "adam_beta_1": 0.9,
+    "adam_beta_2": 0.95,
+    "adam_fused": True,
+    "adam_eps": 1e-12,
+    "weight_decay": 0.1,
+    "grad_norm_clip": 1.0,
+}
+
+LR_CONFIG = {
+    "max_lr": 1e-3,
+    "warmup_steps": 0,
+    "min_lr": None,  # defaults to 10% of max_lr
+}
+
+PATH_CONFIG = {
+    "project_name": "wandb_project",
+    "model_name": "avey-152M",
+    "backup_to_s3": False,
+}
+# -----------------------------------------------------------------------------
+
+
 import random
 import numpy as np
 import torch
 import boto3
-import shutil
 
 import os
 import math
-import logging
 import traceback
 from typing import Tuple, List
 
@@ -36,47 +72,9 @@ parser.add_argument(
 args, _ = parser.parse_known_args()
 d_bsz = int(args.device_bsz)
 
-# -----------------------------------------------------------------------------
-# CONFIGURATION
-# -----------------------------------------------------------------------------
-# Global debug flag and tokenizer name.
-MODEL_TOKENIZER = "p50k_base"
-
-# Training parameters
-TRAIN_CONFIG = {
-    "total_batch_size": 2 ** 19,  # ~0.5M tokens
-    "micro_batch_size": d_bsz,
-    "seq_length": 512,
-    "grad_accum_steps": None,     # to be computed as total_batch_size divided by B * T * world_size
-    "max_steps": 4000,
-    "inference_interval": 2000,
-    "checkpoint_interval": 5000,
-    "grad_norm_clip": 1.0,
-    "rng_seed": 11,
-    "use_compile": True
-}
-
-LR_CONFIG = {
-    "max_lr": 1e-3,
-    "warmup_steps": 0,
-    "min_lr": None  # defaults to 10% of max_lr
-}
-
-PATH_CONFIG = {
-    "project_name": "wandb_project",
-    "model_name": "avey-152M"
-}
-
+TRAIN_CONFIG["micro_batch_size"] = d_bsz
 LR_CONFIG["min_lr"] = LR_CONFIG["min_lr"] if LR_CONFIG["min_lr"] is not None else LR_CONFIG["max_lr"] / 10
 PATH_CONFIG["save_dir"] = os.path.join("checkpoints", PATH_CONFIG["model_name"])
-
-# Logger Setup
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.INFO)
-formatter = logging.Formatter('[%(asctime)s][%(levelname)s] %(message)s')
-console_handler = logging.StreamHandler()
-console_handler.setFormatter(formatter)
-logger.addHandler(console_handler)
 
 model_name = PATH_CONFIG["model_name"]
 
@@ -146,10 +144,7 @@ def backup_to_s3(local_directory, bucket_name="aveylm-backup"):
             print(f"Uploading {local_path} to S3 bucket {bucket_name}")
             s3_client.upload_file(local_path, bucket_name, f"exprv2/{local_path}")
 
-def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float, device_type: str) -> torch.optim.Optimizer:
-    """
-    Set up optimizer parameter groups with weight decay applied only to parameters with dim >=2.
-    """
+def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: float) -> torch.optim.Optimizer:
     param_dict = {pn: p for pn, p in model.named_parameters() if p.requires_grad}
     decay_params = [p for _, p in param_dict.items() if p.dim() >= 2]
     nodecay_params = [p for _, p in param_dict.items() if p.dim() < 2]
@@ -162,10 +157,16 @@ def configure_optimizers(model: nn.Module, weight_decay: float, learning_rate: f
     num_decay_params = sum(p.numel() for p in decay_params)
     num_nodecay_params = sum(p.numel() for p in nodecay_params)
     if master_process:
-        logger.info(f"Number of decayed parameter tensors: {len(decay_params)} with {num_decay_params:,} parameters")
-        logger.info(f"Number of non-decayed parameter tensors: {len(nodecay_params)} with {num_nodecay_params:,} parameters")
+        print(f"Number of decayed parameter tensors: {len(decay_params)} with {num_decay_params:,} parameters")
+        print(f"Number of non-decayed parameter tensors: {len(nodecay_params)} with {num_nodecay_params:,} parameters")
 
-    optimizer = torch.optim.AdamW(optim_groups, lr=learning_rate, betas=(0.9, 0.95), eps=1e-12, fused=True)
+    optimizer = torch.optim.AdamW(
+        optim_groups,
+        lr=learning_rate,
+        betas=(TRAIN_CONFIG["adam_beta_1"], TRAIN_CONFIG["adam_beta_2"]),
+        eps=TRAIN_CONFIG["adam_eps"],
+        fused=TRAIN_CONFIG["adam_fused"]
+    )
     return optimizer
 
 def get_lr(it: int) -> float:
@@ -215,16 +216,18 @@ def main():
         ddp_local_rank = 0
         ddp_world_size = 1
         master_process = True
-        device = "cuda" if torch.cuda.is_available() else (
-                    "mps" if hasattr(torch.backends, "mps") and torch.backends.mps.is_available() else "cpu")
-        logger.info(f"Using device: {device}")
+        device = "cpu"
+        if torch.cuda.is_available():
+            device = "cuda"
+        elif torch.backends.mps.is_available():
+            device = "mps"
+        print(f"Using device: {device}")
 
     device_type = "cuda" if device.startswith("cuda") else "cpu"
 
     # -----------------------------------------------------------------------------
     # Initialize WandB and checkpoint directories
     # -----------------------------------------------------------------------------
-    optimizer_ckpt_filename = "optimizer_state.ckpt"
     os.makedirs(PATH_CONFIG["save_dir"], exist_ok=True)
     log_file = os.path.join(PATH_CONFIG["save_dir"], "log.txt")
 
@@ -266,8 +269,8 @@ def main():
         print("PARAMERETS:", sum(p.numel() for p in model.parameters()))
     model.to(device)
 
-    use_compile = TRAIN_CONFIG["use_compile"]
-    if use_compile:
+    use_torch_compile = TRAIN_CONFIG["use_torch_compile"]
+    if use_torch_compile:
         model = torch.compile(model)
     if ddp:
         model = DDP(model, device_ids=[ddp_local_rank])
@@ -279,9 +282,11 @@ def main():
     # Inference prompt for generating sample completions.
     # -----------------------------------------------------------------------------
     prompt_str = "Turing machines are"
-    prog_bar = tqdm(range(0, TRAIN_CONFIG["max_steps"]),
-                    desc="Step", initial=0, total=TRAIN_CONFIG["max_steps"],
-                    disable=(not master_process))
+    prog_bar = tqdm(
+        range(0, TRAIN_CONFIG["max_steps"]),
+        desc="Step", initial=0, total=TRAIN_CONFIG["max_steps"],
+        disable=(not master_process)
+    )
 
     # -----------------------------------------------------------------------------
     # Training Loop
@@ -323,7 +328,7 @@ def main():
 
         # --- GENERATE SAMPLE COMPLETIONS ---
         if master_process and (step % TRAIN_CONFIG["inference_interval"] == 0) and (step > 0):
-            logger.info(f"\n=== Generation Samples at Step {step} ===")
+            print(f"\n=== Generation Samples at Step {step} ===")
             generation_logs = [
                 f"Step: {step}",
                 f"Loss: {loss_accum.item():.6f}",
@@ -331,60 +336,40 @@ def main():
             ]
             current_input_ids = torch.tensor([inference_tokenizer.encode(prompt_str)], device=device)
             for i in range(5):  # generate 5 completions
-                gen_ids = raw_model.generate(current_input_ids, max_new_tokens=20, do_sample=True, temperature=0.7)
+                gen_ids = raw_model.generate(current_input_ids, max_new_tokens=30, do_sample=True, temperature=0.7)
                 gen_text = inference_tokenizer.decode(gen_ids[0].tolist())
                 generation_logs.append(f"  Completion {i+1}: {gen_text}")
-                logger.info(f"Completion {i+1}: {gen_text}")
+                print(f"Completion {i+1}: {gen_text}")
             generation_logs.append("=" * 40 + "\n")
             with open(log_file, "a") as f:
                 f.write("\n".join(generation_logs) + "\n")
-            logger.info("==========================================\n")
+            print("==========================================\n")
 
-        if master_process and ((step+1) % TRAIN_CONFIG["checkpoint_interval"] == 0) and (step > 0) and not (resumed and step == start_step):
+        if master_process and ((step+1) % TRAIN_CONFIG["checkpoint_interval"] == 0) and (step > 0):
+            # I added this while loop here cuz i had a training run crash once cuz the thing ran out of storage. absolutely not fun at all
             while True:
                 try:
                     ckpt_dir = os.path.join(PATH_CONFIG["save_dir"], f"checkpoint_{step}")
-                    ckpt_file = os.path.join(ckpt_dir, optimizer_ckpt_filename)
-                    checkpoint_data = {
-                        "step": step,
-                        "optimizer_state_dict": optimizer.state_dict(),
-                        "loader_idx": train_loader.current_idx,
-                        "loader_buffer": train_loader.current_buffer,
-                        "rng_state": torch.get_rng_state(),
-                    }
-                    logger.info(f"Saving checkpoint to {ckpt_dir} ...")
                     raw_model.save_pretrained(ckpt_dir)
-                    torch.save(checkpoint_data, f"{ckpt_file}")
 
-                    backup_to_s3(ckpt_dir)
+                    if PATH_CONFIG["backup_to_s3"]:
+                        backup_to_s3(ckpt_dir)
 
-                    # Delete the checkpoint folder after successful backup
-                    shutil.rmtree(ckpt_dir)
-                    logger.info(f"Checkpoint {ckpt_dir} deleted after uploading to S3.")
-
-                    break  # Break out of the while loop if everything is successful
-
+                    break
                 except Exception as e:
-                    # Print traceback for easier debugging
-                    logger.error(f"Exception during checkpointing: {e}")
+                    print(f"\nException during checkpointing: {e}")
                     traceback.print_exc()
                     input("Checkpointing failed. Please fix the issue and press Enter to retry...")
 
-    # -----------------------------------------------------------------------------
-    # Finalize Training
-    # -----------------------------------------------------------------------------
     if master_process:
-        logger.info("Saving final model...")
+        print("Saving final model...")
         raw_model.save_pretrained(PATH_CONFIG["save_dir"])
-        logger.info("Model saved.")
+        print("Model saved.")
 
     if ddp:
         destroy_process_group()
 
 
-# -----------------------------------------------------------------------------
-# Main execution entrypoint.
-# -----------------------------------------------------------------------------
 if __name__ == "__main__":
     try:
         main()
