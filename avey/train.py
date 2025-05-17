@@ -276,7 +276,7 @@ def main():
         model = DDP(model, device_ids=[ddp_local_rank])
     raw_model = model.module if ddp else model
 
-    optimizer = configure_optimizers(raw_model, weight_decay=0.1, learning_rate=LR_CONFIG["max_lr"], device_type=device_type)
+    optimizer = configure_optimizers(raw_model, weight_decay=0.1, learning_rate=LR_CONFIG["max_lr"])
 
     # -----------------------------------------------------------------------------
     # Inference prompt for generating sample completions.
